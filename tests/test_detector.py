@@ -61,3 +61,57 @@ def test_denylist_adds_custom_hits() -> None:
     _, dets = detector.detect(text, config=cfg, language="en")
     custom = [d for d in dets if d.entity_type == "CUSTOM"]
     assert custom and custom[0].text == "Project Falcon"
+
+
+def test_case_number_does_not_eat_italian_words() -> None:
+    """Regression: v1 regex tagged every Italian ``nel``/``nella``/``non``
+    as CASE_NUMBER because Presidio compiles patterns case-insensitively
+    and the marker accepted bare ``N`` followed by any letters.
+    """
+    text = (
+        "Nella riunione del 10 novembre, non sono state discusse le nuove "
+        "negoziazioni nei termini previsti dalla normativa."
+    )
+    _, dets = detector.detect(text, language="it")
+    case_hits = [d for d in dets if d.entity_type == "CASE_NUMBER"]
+    assert case_hits == []
+
+
+def test_case_number_still_matches_real_references() -> None:
+    text = "Procedimento R.G. 4567/2024 e nota N. 12/2023; Case No. 21-cv-04567."
+    _, dets = detector.detect(text, language="en")
+    surfaces = {d.text for d in dets if d.entity_type == "CASE_NUMBER"}
+    assert any("4567/2024" in s for s in surfaces)
+    assert any("21-cv-04567" in s for s in surfaces)
+
+
+def test_noise_filter_drops_italian_legal_terms() -> None:
+    """spaCy's IT model tags 'Parti', 'Servizi dell'Advisor', 'Stretto
+    Familiare', 'Abbandono' as LOC/ORG. The legal stoplist should
+    suppress them so the preview isn't drowned in noise.
+    """
+    text = (
+        "Le Parti convengono che i Servizi dell'Advisor saranno prestati "
+        "secondo la normativa. Stretto Familiare e Abbandono sono definiti "
+        "nelle Premesse."
+    )
+    _, dets = detector.detect(text, language="it")
+    surfaces = {d.text for d in dets}
+    for noise in ("Parti", "Servizi dell'Advisor", "Stretto Familiare", "Abbandono", "Premesse"):
+        assert noise not in surfaces, f"expected {noise!r} to be filtered"
+
+
+def test_noise_filter_drops_single_letter_hits() -> None:
+    """Single-letter LOC hits ('F', 'A') from spaCy are always noise."""
+    text = "Visto F e A. Mario Bianchi è il rappresentante."
+    _, dets = detector.detect(text, language="it")
+    short = [d for d in dets if len(d.text.strip()) <= 1]
+    assert short == []
+
+
+def test_noise_filter_keeps_real_proper_nouns() -> None:
+    text = "Mario Bianchi lavora per Globex S.r.l. a Milano."
+    _, dets = detector.detect(text, language="it")
+    surfaces = {d.text for d in dets}
+    # The real names must still come through.
+    assert "Mario Bianchi" in surfaces or any("Mario" in s for s in surfaces)

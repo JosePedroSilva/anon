@@ -13,8 +13,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtWidgets import QTextEdit as _QTextEdit  # for ExtraSelection type
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.entities import Detection
+from ..core.placeholder import canonicalise
 
 
 @dataclass
@@ -47,10 +49,14 @@ class PreviewDialog(QDialog):
         self._flat_text = flat_text
         self._detections = detections
 
+        # Header counts: show both unique-entity and total-mention counts
+        # so the user understands the dedupe.
+        unique_count = len({(d.entity_type, canonicalise(d.entity_type, d.text)) for d in detections})
         layout = QVBoxLayout(self)
         layout.addWidget(
             QLabel(
-                f"{len(detections)} entities detected. Untick anything you want to keep as-is.",
+                f"{unique_count} unique entities ({len(detections)} mentions). "
+                "Untick anything you want to keep as-is — one untick removes all mentions.",
             )
         )
 
@@ -61,8 +67,10 @@ class PreviewDialog(QDialog):
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Surface", "Type", "Score"])
         self._tree.setColumnWidth(0, 320)
-        self._tree.itemChanged.connect(self._on_item_changed)
+        # Populate before connecting itemChanged so we don't fire the
+        # checkbox-change handler thousands of times during build.
         self._populate_tree(detections)
+        self._tree.itemChanged.connect(self._on_item_changed)
         splitter.addWidget(self._tree)
 
         # Right: before/after text with the selected detections highlighted.
@@ -72,7 +80,24 @@ class PreviewDialog(QDialog):
         right_layout.addWidget(QLabel("Preview (approved redactions highlighted):"))
         self._preview = QTextEdit()
         self._preview.setReadOnly(True)
+        # Cache the full text once. ExtraSelections paint on top of the
+        # existing document so we don't re-render text on every toggle.
+        self._preview.setPlainText(self._flat_text)
         right_layout.addWidget(self._preview, 1)
+
+        # Pre-build the highlight format once.
+        self._hl_format = QTextCharFormat()
+        self._hl_format.setBackground(QColor("#fbbf24"))
+        self._hl_format.setForeground(QColor("#1f2937"))
+        self._hl_format.setFontUnderline(True)
+        self._hl_format.setUnderlineColor(QColor("#92400e"))
+
+        # Debounce: ticking a group fires itemChanged for every child.
+        # Coalesce the burst into one refresh.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(40)
+        self._refresh_timer.timeout.connect(self._refresh_preview)
 
         add_row = QHBoxLayout()
         add_row.addWidget(QLabel("Also redact (comma-separated):"))
@@ -107,20 +132,43 @@ class PreviewDialog(QDialog):
     # ----- tree population & checkbox logic -----
 
     def _populate_tree(self, detections: list[Detection]) -> None:
-        by_type: dict[str, list[Detection]] = {}
+        # Group: type → canonical key → list of detections (mentions).
+        # The canonical key is the same one the placeholder allocator
+        # uses, so the tree view matches the eventual placeholder map.
+        by_type: dict[str, dict[str, list[Detection]]] = {}
         for d in detections:
-            by_type.setdefault(d.entity_type, []).append(d)
+            key = canonicalise(d.entity_type, d.text)
+            by_type.setdefault(d.entity_type, {}).setdefault(key, []).append(d)
 
         for entity_type in sorted(by_type):
-            group = QTreeWidgetItem([f"{entity_type} ({len(by_type[entity_type])})"])
-            group.setFlags(group.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
+            buckets = by_type[entity_type]
+            unique_n = len(buckets)
+            mention_n = sum(len(v) for v in buckets.values())
+            group = QTreeWidgetItem(
+                [f"{entity_type} ({unique_n} unique / {mention_n} mentions)"]
+            )
+            group.setFlags(
+                group.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate
+            )
             group.setCheckState(0, Qt.CheckState.Checked)
             self._tree.addTopLevelItem(group)
-            for det in by_type[entity_type]:
-                child = QTreeWidgetItem([det.text, det.entity_type, f"{det.score:.2f}"])
+
+            # Show buckets ordered by mention count (most frequent first)
+            # so the user spots high-impact false positives quickly.
+            ordered_buckets = sorted(
+                buckets.items(),
+                key=lambda kv: (-len(kv[1]), kv[1][0].text.lower()),
+            )
+            for _key, mentions in ordered_buckets:
+                surface = mentions[0].text  # first-seen form
+                count_label = f"{surface}  ({len(mentions)})" if len(mentions) > 1 else surface
+                avg_score = sum(m.score for m in mentions) / len(mentions)
+                child = QTreeWidgetItem([count_label, entity_type, f"{avg_score:.2f}"])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked)
-                child.setData(0, Qt.ItemDataRole.UserRole, det)
+                # Store the *list* of underlying detections — un/ticking
+                # this leaf affects all of them.
+                child.setData(0, Qt.ItemDataRole.UserRole, mentions)
                 group.addChild(child)
             group.setExpanded(True)
 
@@ -130,45 +178,63 @@ class PreviewDialog(QDialog):
             for j in range(group.childCount()):
                 yield group.child(j)
 
+    def _set_all(self, state: Qt.CheckState) -> None:
+        # Block tree signals so we don't fire (and debounce) for every
+        # leaf when bulk-toggling — one refresh at the end is enough.
+        self._tree.blockSignals(True)
+        try:
+            for leaf in self._iter_leaves():
+                leaf.setCheckState(0, state)
+        finally:
+            self._tree.blockSignals(False)
+        self._refresh_timer.start()
+
     def _select_all(self) -> None:
-        for leaf in self._iter_leaves():
-            leaf.setCheckState(0, Qt.CheckState.Checked)
+        self._set_all(Qt.CheckState.Checked)
 
     def _clear_all(self) -> None:
-        for leaf in self._iter_leaves():
-            leaf.setCheckState(0, Qt.CheckState.Unchecked)
+        self._set_all(Qt.CheckState.Unchecked)
 
     def _on_item_changed(self, *_args: object) -> None:
-        self._refresh_preview()
+        # Coalesce — the QTreeWidget fires this once per affected child
+        # when a parent group is (un)ticked.
+        self._refresh_timer.start()
 
     # ----- preview rendering -----
 
     def _approved_detections(self) -> list[Detection]:
         out: list[Detection] = []
         for leaf in self._iter_leaves():
-            if leaf.checkState(0) == Qt.CheckState.Checked:
-                det = leaf.data(0, Qt.ItemDataRole.UserRole)
-                if isinstance(det, Detection):
-                    out.append(det)
+            if leaf.checkState(0) != Qt.CheckState.Checked:
+                continue
+            payload = leaf.data(0, Qt.ItemDataRole.UserRole)
+            # Each leaf now stores the full list of mentions for one
+            # canonical entity (FIA, FIA Riservato, etc.), so unticking
+            # one row removes every mention from the output.
+            if isinstance(payload, list):
+                out.extend(p for p in payload if isinstance(p, Detection))
+            elif isinstance(payload, Detection):
+                out.append(payload)
         out.sort(key=lambda d: d.start)
         return out
 
     def _refresh_preview(self) -> None:
-        self._preview.clear()
-        self._preview.setPlainText(self._flat_text)
-        # Pick a warm amber that reads well on both dark and light themes;
-        # force the foreground too so the system default white-on-yellow
-        # (unreadable in dark mode) doesn't happen.
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#fbbf24"))  # amber-400
-        fmt.setForeground(QColor("#1f2937"))  # slate-800
-        fmt.setFontUnderline(True)
-        fmt.setUnderlineColor(QColor("#92400e"))  # amber-900
-        cursor = self._preview.textCursor()
+        # ExtraSelections paint highlights as an overlay — far cheaper
+        # than mergeCharFormat per detection (which dirties the document
+        # and triggers a relayout each time). With 1000+ detections,
+        # mergeCharFormat blocked the GUI for seconds; this stays
+        # snappy.
+        doc = self._preview.document()
+        selections: list[_QTextEdit.ExtraSelection] = []
         for det in self._approved_detections():
+            sel = _QTextEdit.ExtraSelection()
+            sel.format = self._hl_format
+            cursor = QTextCursor(doc)
             cursor.setPosition(det.start)
             cursor.setPosition(det.end, QTextCursor.MoveMode.KeepAnchor)
-            cursor.mergeCharFormat(fmt)
+            sel.cursor = cursor
+            selections.append(sel)
+        self._preview.setExtraSelections(selections)
 
     # ----- public result -----
 

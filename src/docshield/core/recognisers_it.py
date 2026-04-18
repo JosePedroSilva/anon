@@ -32,15 +32,26 @@ _IBAN_IT = Pattern(
 )
 
 # Generic case/docket numbers in IT/EN courts. Examples: "R.G. 1234/2024",
-# "Case No. 21-cv-04567", "N. 567/2023". This is best-effort and
-# intentionally requires a leading marker to keep precision high.
+# "Case No. 21-cv-04567", "N. 567/2023".
+#
+# Two precision rules baked in to stop the v1 regex from tagging every
+# Italian ``nel`` / ``nella`` / ``non`` (Presidio compiles patterns with
+# ``re.IGNORECASE``, so ``N`` matched lowercase ``n`` as well):
+#
+# 1. Abbreviation markers (``N.``, ``Num.``) require the trailing dot.
+# 2. The marker MUST be followed by at least one digit. Pure-letter
+#    bodies are no longer accepted.
 _CASE = Pattern(
     name="case_number",
     regex=(
-        r"\b(?:R\.?\s?G\.?|N(?:um)?\.?|Case\s+No\.?|Docket\s+No\.?)"
-        r"\s*[A-Za-z0-9\-]+(?:\s*/\s*\d{2,4})?\b"
+        r"\b(?:"
+        r"R\.\s?G\.\s+\d+(?:[\-/]\d{2,4})?"          # R.G. 1234/2024
+        r"|N(?:um)?\.\s*\d+(?:[\-/]\d{2,4})?"        # N. 567/2023, Num. 12
+        r"|Case\s+No\.?\s*[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*(?:[\-/]\d{2,4})?"
+        r"|Docket\s+No\.?\s*[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*(?:[\-/]\d{2,4})?"
+        r")\b"
     ),
-    score=0.7,
+    score=0.85,
 )
 
 
@@ -73,7 +84,12 @@ def case_number_recogniser(language: str) -> PatternRecognizer:
 
 # Sanity tests for the regexes themselves (used by test_detector.py).
 def _self_check() -> None:  # pragma: no cover - dev helper
+    flags = re.IGNORECASE  # match Presidio's compile flags
     assert re.fullmatch(_CF.regex, "BNCMRA80A01F205X")
     assert re.fullmatch(_IBAN_IT.regex, "IT60X0542811101000000123456")
-    assert re.search(_CASE.regex, "R.G. 1234/2024")
-    assert re.search(_CASE.regex, "Case No. 21-cv-04567")
+    assert re.search(_CASE.regex, "R.G. 1234/2024", flags)
+    assert re.search(_CASE.regex, "Case No. 21-cv-04567", flags)
+    assert re.search(_CASE.regex, "N. 567/2023", flags)
+    # Negatives — these are what the v1 regex got wrong.
+    for word in ("nel", "nella", "nei", "non", "novembre", "natura"):
+        assert not re.search(_CASE.regex, word, flags), word

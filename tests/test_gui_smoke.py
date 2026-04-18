@@ -53,6 +53,33 @@ def test_preview_dialog_returns_checked_subset(qapp) -> None:
     assert payload.extra_terms == ["Project Falcon", "Client-42"]
 
 
+def test_preview_dedupes_repeated_mentions(qapp) -> None:
+    """Three mentions of "FIA Riservato" should appear as a single leaf
+    with a (3) count, and unticking it should drop every underlying
+    detection from the approved list.
+    """
+    text = "FIA Riservato, FIA Riservato, e di nuovo FIA Riservato."
+    detections = [
+        Detection("ORG", 0, 13, "FIA Riservato", 0.85),
+        Detection("ORG", 15, 28, "FIA Riservato", 0.85),
+        Detection("ORG", 41, 54, "FIA Riservato", 0.85),
+    ]
+    dlg = PreviewDialog(text, detections)
+    tree = dlg._tree
+    org_group = next(
+        tree.topLevelItem(i) for i in range(tree.topLevelItemCount())
+        if tree.topLevelItem(i).text(0).startswith("ORG")
+    )
+    assert org_group.childCount() == 1, "duplicates should collapse to one leaf"
+    leaf = org_group.child(0)
+    assert "(3)" in leaf.text(0)
+    # Approved list should hold all 3 mentions.
+    assert len(dlg._approved_detections()) == 3
+    # Untick the leaf → all three should drop out.
+    leaf.setCheckState(0, Qt.CheckState.Unchecked)
+    assert dlg._approved_detections() == []
+
+
 def test_rehydrate_tab_restores_originals(qapp, tmp_path) -> None:
     mapping_path = tmp_path / "m.dsm"
     save_mapping(

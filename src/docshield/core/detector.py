@@ -31,6 +31,7 @@ from .recognisers_it import (
     codice_fiscale_recogniser,
     iban_it_recogniser,
 )
+from .stoplists import STOPLISTS_BY_LANGUAGE
 
 # Subset of Presidio entity names we surface to the user, mapped to the
 # placeholder type names used in the spec (FR-2.1).
@@ -118,6 +119,52 @@ def _filter_allowlist(detections: Iterable[Detection], allowlist: list[str]) -> 
         return list(detections)
     blocked = {_normalise(a) for a in allowlist if a.strip()}
     return [d for d in detections if _normalise(d.text) not in blocked]
+
+
+# spaCy NER types we apply the noise filter to. Pattern-based hits
+# (IBAN, EMAIL, ID_NUMBER, CASE_NUMBER, CREDIT_CARD, URL) are
+# regex-precise and shouldn't be second-guessed.
+_NER_TYPES_FOR_FILTER = frozenset({"PERSON", "ORG", "LOC"})
+
+def _is_noise(det: Detection, language: str) -> bool:
+    """Return True if ``det`` looks like a spaCy NER false positive.
+
+    Rules (only applied to PERSON/ORG/LOC — pattern hits are trusted):
+
+    1. Surface < 2 visible chars → almost always a stray initial.
+    2. Surface starts with a lowercase letter — proper nouns must be
+       capitalised in EN/IT.
+    3. **Every token** of the canonicalised surface is in the language's
+       legal stoplist. This catches "Servizi dell'Advisor" because
+       "servizi", "dell" and "advisor" are all stoplisted, while letting
+       "Mario Bianchi" through (neither token is stoplisted).
+    """
+    if det.entity_type not in _NER_TYPES_FOR_FILTER:
+        return False
+    surface = det.text.strip()
+    if len(surface) < 2:
+        return True
+    first_alpha = next((c for c in surface if c.isalpha()), "")
+    if first_alpha and first_alpha.islower():
+        return True
+    stoplist = STOPLISTS_BY_LANGUAGE.get(language, frozenset())
+    if not stoplist:
+        return False
+    # Tokenise on whitespace AND apostrophes BEFORE normalising — Italian
+    # elisions ("dell'", "all'", "nell'") attach to the next word. If we
+    # let ``_normalise`` strip the apostrophe first, "dell'Advisor"
+    # collapses to "delladvisor" and stoplist matching fails.
+    import re as _re
+    raw_tokens = [t for t in _re.split(r"[\s'’]+", surface) if t]
+    tokens = [_normalise(t) for t in raw_tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return True
+    return all(t in stoplist for t in tokens)
+
+
+def _filter_noise(detections: Iterable[Detection], language: str) -> list[Detection]:
+    return [d for d in detections if not _is_noise(d, language)]
 
 
 def _denylist_hits(text: str, denylist: list[str]) -> list[Detection]:
@@ -212,6 +259,7 @@ def detect(
             )
         )
 
+    out = _filter_noise(out, lang)
     out = _filter_allowlist(out, cfg.allowlist)
     out.extend(_denylist_hits(text, cfg.denylist))
     out = _resolve_overlaps(out)
