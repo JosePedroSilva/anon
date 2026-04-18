@@ -1,0 +1,55 @@
+name: Build Windows bundle
+
+# Manual trigger (Actions tab → Run workflow) and every tag push.
+# The produced .zip ends up as a workflow artifact you can download from
+# the run's summary page. No code signing — users will need to click
+# through SmartScreen's "unknown publisher" warning. For distribution to
+# non-technical users, sign with an EV cert (a separate ask).
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --upgrade pip
+          # Install the project plus packaging + GUI extras.
+          .venv\Scripts\pip install -e ".[gui]" pyinstaller
+
+      - name: Download spaCy models
+        shell: pwsh
+        run: |
+          .venv\Scripts\python -m spacy download en_core_web_lg
+          .venv\Scripts\python -m spacy download it_core_news_lg
+
+      - name: Build bundle
+        shell: pwsh
+        run: |
+          .\packaging\build_windows.ps1
+
+      - name: Zip the bundle
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\DocShield -DestinationPath dist\DocShield-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocShield-windows
+          path: dist/DocShield-windows.zip
+          retention-days: 30

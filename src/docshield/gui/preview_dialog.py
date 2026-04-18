@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -156,8 +156,14 @@ class PreviewDialog(QDialog):
     def _refresh_preview(self) -> None:
         self._preview.clear()
         self._preview.setPlainText(self._flat_text)
+        # Pick a warm amber that reads well on both dark and light themes;
+        # force the foreground too so the system default white-on-yellow
+        # (unreadable in dark mode) doesn't happen.
         fmt = QTextCharFormat()
-        fmt.setBackground(Qt.GlobalColor.yellow)
+        fmt.setBackground(QColor("#fbbf24"))  # amber-400
+        fmt.setForeground(QColor("#1f2937"))  # slate-800
+        fmt.setFontUnderline(True)
+        fmt.setUnderlineColor(QColor("#92400e"))  # amber-900
         cursor = self._preview.textCursor()
         for det in self._approved_detections():
             cursor.setPosition(det.start)
