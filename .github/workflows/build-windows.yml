@@ -1,15 +1,18 @@
 name: Build Windows bundle
 
-# Manual trigger (Actions tab → Run workflow) and every tag push.
-# The produced .zip ends up as a workflow artifact you can download from
-# the run's summary page. No code signing — users will need to click
-# through SmartScreen's "unknown publisher" warning. For distribution to
-# non-technical users, sign with an EV cert (a separate ask).
+# Triggers:
+# * Manual ("Run workflow" in the Actions tab) — produces a workflow
+#   artifact only. Useful for testing.
+# * Tag push (``git tag v0.1.0 && git push --tags``) — produces a
+#   Release with the .zip attached and a public download URL.
 on:
   workflow_dispatch:
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: write  # required so the action can create a Release
 
 jobs:
   build:
@@ -28,7 +31,6 @@ jobs:
         run: |
           python -m venv .venv
           .venv\Scripts\python -m pip install --upgrade pip
-          # Install the project plus packaging + GUI extras.
           .venv\Scripts\pip install -e ".[gui]" pyinstaller
 
       - name: Download spaCy models
@@ -47,9 +49,28 @@ jobs:
         run: |
           Compress-Archive -Path dist\DocShield -DestinationPath dist\DocShield-windows.zip
 
-      - name: Upload artifact
+      - name: Compute SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\DocShield-windows.zip -Algorithm SHA256).Hash
+          "DocShield-windows.zip  $hash" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Upload workflow artifact (always)
         uses: actions/upload-artifact@v4
         with:
           name: DocShield-windows
-          path: dist/DocShield-windows.zip
+          path: |
+            dist/DocShield-windows.zip
+            dist/SHA256SUMS.txt
           retention-days: 30
+
+      - name: Publish Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # Auto-generated release notes from PRs/commits since the last tag.
+          generate_release_notes: true
+          files: |
+            dist/DocShield-windows.zip
+            dist/SHA256SUMS.txt
